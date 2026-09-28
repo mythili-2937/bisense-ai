@@ -1410,7 +1410,7 @@ elif page == "About":
 st.markdown(
     """
     <div class="footer-text">
-        BISense AI • Internal Hackathon Prototype
+        BISense AI • Hackathon Prototype
     </div>
     """,
     unsafe_allow_html=True
