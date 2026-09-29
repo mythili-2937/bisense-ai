@@ -3,38 +3,23 @@ from dotenv import load_dotenv
 from pathlib import Path
 import os
 import json
+import time
+import random
 
-# Optional Streamlit import so this file still works from terminal.
 try:
     import streamlit as st
 except ImportError:
     st = None
 
-
-# -------------------------------------------------
-# ENVIRONMENT / API KEY
-# -------------------------------------------------
-
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-# Local development: load .env if it exists.
 load_dotenv(BASE_DIR / ".env")
 
 
 def get_api_key():
-    """
-    Load Gemini API key from:
-    1. Local environment / .env
-    2. Streamlit Secrets (for Streamlit Community Cloud)
-    """
-
-    # Local .env / environment variable
     key = os.getenv("GEMINI_API_KEY")
-
     if key:
         return key
 
-    # Streamlit Cloud secrets
     if st is not None:
         try:
             if "GEMINI_API_KEY" in st.secrets:
@@ -50,21 +35,14 @@ def get_api_key():
 
 
 api_key = get_api_key()
-
 client = genai.Client(api_key=api_key)
-
 MODEL_NAME = "gemini-3.6-flash"
 
-
-# -------------------------------------------------
-# HELPERS
-# -------------------------------------------------
 
 def _clean_json_text(text):
     text = (text or "").strip()
     text = text.replace("```json", "").replace("```", "").strip()
 
-    # Keep only the outer JSON object if the model adds extra text.
     start = text.find("{")
     end = text.rfind("}")
 
@@ -74,18 +52,64 @@ def _clean_json_text(text):
     return text
 
 
-# -------------------------------------------------
-# REQUIREMENT ANALYSIS
-# -------------------------------------------------
+def _is_rate_limit_error(exc):
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+
+    indicators = [
+        "ratelimit",
+        "rate limit",
+        "429",
+        "resource_exhausted",
+        "resource exhausted",
+        "quota",
+        "too many requests",
+    ]
+
+    return any(
+        indicator in name or indicator in message
+        for indicator in indicators
+    )
+
+
+def _call_gemini(prompt, retries=3):
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            return client.interactions.create(
+                model=MODEL_NAME,
+                input=prompt
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            if _is_rate_limit_error(exc):
+                if attempt < retries - 1:
+                    wait_seconds = (4 * (attempt + 1)) + random.uniform(0, 1.5)
+                    time.sleep(wait_seconds)
+                    continue
+
+                raise RuntimeError(
+                    "Gemini API rate limit or quota has been reached. "
+                    "Please wait for the quota window to reset, or check the "
+                    "Gemini API usage/quota for the API key used by this app."
+                ) from exc
+
+            raise RuntimeError(
+                f"Gemini request failed: {type(exc).__name__}. "
+                "Please check the Streamlit logs for more details."
+            ) from exc
+
+    raise RuntimeError(
+        "Gemini request failed after multiple attempts."
+    ) from last_error
+
 
 def analyze_requirement(requirement, response_language="English"):
-    """
-    Understand a procurement requirement in English, Tamil, Hindi,
-    or mixed-language input.
-
-    All display fields are returned in the selected response language.
-    search_query is always returned in English for semantic search.
-    """
+    if not requirement or not requirement.strip():
+        raise ValueError("Procurement requirement cannot be empty.")
 
     prompt = f"""
 You are an AI assistant for procurement standards discovery.
@@ -121,23 +145,16 @@ Return ONLY valid JSON in exactly this structure:
 }}
 """
 
-    response = client.interactions.create(
-        model=MODEL_NAME,
-        input=prompt
-    )
-
+    response = _call_gemini(prompt)
     text = _clean_json_text(response.output_text)
 
     try:
         data = json.loads(text)
-
     except json.JSONDecodeError as exc:
         raise ValueError(
-            "Gemini returned an invalid JSON response. "
-            f"Raw response: {response.output_text}"
+            "Gemini returned an invalid JSON response. Please try again."
         ) from exc
 
-    # Normalize structure so Streamlit can safely use it.
     data.setdefault("product", "")
     data.setdefault("category", "")
     data.setdefault("specifications", [])
@@ -154,19 +171,13 @@ Return ONLY valid JSON in exactly this structure:
     return data
 
 
-# -------------------------------------------------
-# RECOMMENDATION EXPLANATION
-# -------------------------------------------------
-
 def explain_recommendations(
     requirement,
     standards,
     response_language="English"
 ):
-    """
-    Explain retrieved standards using only supplied retrieval results.
-    The explanation is returned in the selected response language.
-    """
+    if not standards:
+        return "No relevant standards were retrieved for this requirement."
 
     prompt = f"""
 You are an AI procurement standards assistant.
@@ -198,39 +209,75 @@ Rules:
 Return only the explanation in clean Markdown.
 """
 
-    response = client.interactions.create(
-        model=MODEL_NAME,
-        input=prompt
-    )
+    try:
+        response = _call_gemini(prompt)
+        return (response.output_text or "").strip()
 
-    return (response.output_text or "").strip()
+    except RuntimeError as exc:
+        message = str(exc).lower()
 
+        if "rate limit" not in message and "quota" not in message:
+            raise
 
-# -------------------------------------------------
-# OPTIONAL TERMINAL TEST
-# -------------------------------------------------
+        lines = [
+            "### Recommendation Summary",
+            "",
+            "Gemini explanation is temporarily unavailable due to API limits.",
+            "The retrieved standards are still shown from the semantic search results:",
+            ""
+        ]
+
+        for standard in standards:
+            standard_id = standard.get("standard_id", "Unknown")
+            title = standard.get("title", "Untitled standard")
+            product = standard.get("product", "")
+            category = standard.get("category", "")
+            score = standard.get("score", "")
+
+            detail_parts = []
+
+            if product:
+                detail_parts.append(f"Product: {product}")
+
+            if category:
+                detail_parts.append(f"Category: {category}")
+
+            if score != "":
+                detail_parts.append(f"Semantic match: {score}%")
+
+            details = " | ".join(detail_parts)
+
+            if details:
+                lines.append(
+                    f"- **{standard_id} — {title}**  \n  {details}"
+                )
+            else:
+                lines.append(
+                    f"- **{standard_id} — {title}**"
+                )
+
+        return "\n".join(lines)
+
 
 if __name__ == "__main__":
-
-    requirement = input(
-        "Enter procurement requirement: "
-    )
-
+    requirement = input("Enter procurement requirement: ")
     language = input(
         "Response language (English/Tamil/Hindi): "
     ).strip() or "English"
 
-    result = analyze_requirement(
-        requirement,
-        language
-    )
+    try:
+        result = analyze_requirement(requirement, language)
 
-    print("\nAI Requirement Analysis")
-    print("------------------------")
-    print(
-        json.dumps(
-            result,
-            indent=2,
-            ensure_ascii=False
+        print("\nAI Requirement Analysis")
+        print("------------------------")
+        print(
+            json.dumps(
+                result,
+                indent=2,
+                ensure_ascii=False
+            )
         )
-    )
+
+    except Exception as exc:
+        print("\nError:")
+        print(str(exc))
